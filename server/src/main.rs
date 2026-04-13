@@ -706,26 +706,29 @@ async fn reverse_geocode(
     state: axum::extract::State<Arc<RwLock<auth::Db>>>,
     index: axum::extract::Extension<Arc<Index>>,
     limiter: axum::extract::Extension<Arc<auth::RateLimiter>>,
+    axum::extract::Extension(no_auth): axum::extract::Extension<bool>,
     connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    let key = match params.key {
-        Some(k) => k,
-        None => return (StatusCode::UNAUTHORIZED, "Missing API key").into_response(),
-    };
+    if !no_auth {
+        let key = match params.key {
+            Some(k) => k,
+            None => return (StatusCode::UNAUTHORIZED, "Missing API key").into_response(),
+        };
 
-    let (login, rps, rpd, by_ip) = match state.read().unwrap().validate_token(&key) {
-        Some(info) => info,
-        None => return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response(),
-    };
+        let (login, rps, rpd, by_ip) = match state.read().unwrap().validate_token(&key) {
+            Some(info) => info,
+            None => return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response(),
+        };
 
-    let rate_key = if by_ip {
-        format!("{}:{}", login, connect_info.0.ip())
-    } else {
-        login
-    };
+        let rate_key = if by_ip {
+            format!("{}:{}", login, connect_info.0.ip())
+        } else {
+            login
+        };
 
-    if let Err(msg) = auth::check_rate(&limiter, &rate_key, rps, rpd) {
-        return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
+        if let Err(msg) = auth::check_rate(&limiter, &rate_key, rps, rpd) {
+            return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
+        }
     }
 
     let address = index.query(params.lat, params.lon);
@@ -757,6 +760,11 @@ async fn main() {
         }
     };
 
+    let no_auth = std::env::var("GEOCODER_NO_AUTH").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    if no_auth {
+        eprintln!("Warning: authentication disabled (GEOCODER_NO_AUTH)");
+    }
+
     let db = Arc::new(RwLock::new(db));
     let limiter = Arc::new(auth::RateLimiter::default()); // RwLock<HashMap> with atomic counters
 
@@ -765,6 +773,7 @@ async fn main() {
         .merge(auth::router())
         .layer(axum::Extension(index))
         .layer(axum::Extension(limiter))
+        .layer(axum::Extension(no_auth))
         .with_state(db);
 
     // ACME mode: --domain <domain> [--cache <dir>]

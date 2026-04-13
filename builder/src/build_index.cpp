@@ -61,6 +61,14 @@ struct AdminPolygon {
     uint16_t country_code;
 };
 
+struct PlaceNode {
+    float lat;
+    float lng;
+    uint32_t name_id;
+    uint8_t rank; // 1=city, 2=town, 3=village, 4=suburb, 5=hamlet
+    uint8_t _pad[3];
+};
+
 struct NodeCoord {
     float lat;
     float lng;
@@ -115,10 +123,25 @@ static std::vector<AdminPolygon> admin_polygons;
 static std::vector<NodeCoord> admin_vertices;
 static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
 
+// Place nodes
+static std::vector<PlaceNode> place_nodes;
+static std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_places;
+
 // --- S2 helpers ---
 
 static int kStreetCellLevel = 17;
 static int kAdminCellLevel = 10;
+static int kPlaceCellLevel = 13;
+
+// place=* rank: 1=city, 2=town, 3=village, 4=suburb, 5=hamlet
+static uint8_t place_rank(const char* place) {
+    if (strcmp(place, "city") == 0) return 1;
+    if (strcmp(place, "town") == 0) return 2;
+    if (strcmp(place, "village") == 0) return 3;
+    if (strcmp(place, "suburb") == 0) return 4;
+    if (strcmp(place, "hamlet") == 0) return 5;
+    return 0;
+}
 
 static std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, double lng2) {
     S2Point p1 = S2LatLng::FromDegrees(lat1, lng1).ToPoint();
@@ -399,13 +422,38 @@ static void add_admin_polygon(const std::vector<std::pair<double,double>>& verti
 class BuildHandler : public osmium::handler::Handler {
 public:
     void node(const osmium::Node& node) {
-        const char* housenumber = node.tags()["addr:housenumber"];
-        if (!housenumber) return;
-        const char* street = node.tags()["addr:street"];
-        if (!street) return;
         if (!node.location().valid()) return;
 
-        add_addr_point(node.location().lat(), node.location().lon(), housenumber, street);
+        // Address nodes
+        const char* housenumber = node.tags()["addr:housenumber"];
+        if (housenumber) {
+            const char* street = node.tags()["addr:street"];
+            if (street) {
+                add_addr_point(node.location().lat(), node.location().lon(), housenumber, street);
+            }
+        }
+
+        // Place nodes (city, town, village, suburb, hamlet)
+        const char* place_tag = node.tags()["place"];
+        if (place_tag) {
+            uint8_t rank = place_rank(place_tag);
+            if (rank > 0) {
+                const char* name = node.tags()["name"];
+                if (name) {
+                    uint32_t place_id = static_cast<uint32_t>(place_nodes.size());
+                    PlaceNode pn{};
+                    pn.lat = static_cast<float>(node.location().lat());
+                    pn.lng = static_cast<float>(node.location().lon());
+                    pn.name_id = strings.intern(name);
+                    pn.rank = rank;
+                    place_nodes.push_back(pn);
+
+                    S2CellId cell = S2CellId(S2LatLng::FromDegrees(
+                        node.location().lat(), node.location().lon())).parent(kPlaceCellLevel);
+                    cell_to_places[cell.id()].push_back(place_id);
+                }
+            }
+        }
     }
 
     void way(const osmium::Way& way) {
@@ -777,6 +825,13 @@ static void write_index(const std::string& output_dir) {
     write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", cell_to_admin);
     std::cerr << "admin index: " << cell_to_admin.size() << " cells, " << admin_polygons.size() << " polygons" << std::endl;
 
+    write_cell_index(output_dir + "/place_cells.bin", output_dir + "/place_entries.bin", cell_to_places);
+    {
+        std::ofstream f(output_dir + "/place_nodes.bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(place_nodes.data()), place_nodes.size() * sizeof(PlaceNode));
+    }
+    std::cerr << "place index: " << cell_to_places.size() << " cells, " << place_nodes.size() << " nodes" << std::endl;
+
     // Street ways
     {
         std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
@@ -897,6 +952,7 @@ int main(int argc, char* argv[]) {
     std::cerr << "  " << handler.interp_count() << " interpolation ways" << std::endl;
     std::cerr << "  " << handler.admin_count() << " admin/postcode boundaries ("
               << admin_polygons.size() << " polygon rings)" << std::endl;
+    std::cerr << "  " << place_nodes.size() << " place nodes" << std::endl;
 
     std::cerr << "Resolving interpolation endpoints..." << std::endl;
     resolve_interpolation_endpoints();
@@ -906,6 +962,7 @@ int main(int argc, char* argv[]) {
     deduplicate(cell_to_addrs);
     deduplicate(cell_to_interps);
     deduplicate(cell_to_admin);
+    deduplicate(cell_to_places);
 
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
     write_index(output_dir);

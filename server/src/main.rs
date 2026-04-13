@@ -17,6 +17,7 @@ use std::sync::{Arc, RwLock};
 
 const DEFAULT_STREET_CELL_LEVEL: u64 = 17;
 const DEFAULT_ADMIN_CELL_LEVEL: u64 = 10;
+const DEFAULT_PLACE_CELL_LEVEL: u64 = 13;
 const DEFAULT_SEARCH_DISTANCE: f64 = 75.0;
 
 fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
@@ -61,6 +62,16 @@ struct InterpWay {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct PlaceNode {
+    lat: f32,
+    lng: f32,
+    name_id: u32,
+    rank: u8,
+    _pad: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct AdminPolygon {
     vertex_offset: u32,
     vertex_count: u16,
@@ -93,9 +104,13 @@ struct Index {
     admin_entries: Mmap,
     admin_polygons: Mmap,
     admin_vertices: Mmap,
+    place_cells: Option<Mmap>,
+    place_entries: Option<Mmap>,
+    place_nodes: Option<Mmap>,
     strings: Mmap,
     street_cell_level: u64,
     admin_cell_level: u64,
+    place_cell_level: u64,
     max_distance_sq: f64,
 }
 
@@ -112,8 +127,12 @@ fn mmap_file(path: &str) -> Result<Mmap, String> {
     unsafe { Mmap::map(&file).map_err(|e| format!("Failed to mmap {}: {}", path, e)) }
 }
 
+fn mmap_file_optional(path: &str) -> Option<Mmap> {
+    File::open(path).ok().and_then(|f| unsafe { Mmap::map(&f).ok() })
+}
+
 impl Index {
-    fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
+    fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, place_cell_level: u64, search_distance: f64) -> Result<Self, String> {
         let meters_to_rad = search_distance / 111_320.0;
         let max_distance_sq = meters_to_rad * meters_to_rad;
         Ok(Index {
@@ -130,9 +149,13 @@ impl Index {
             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
             admin_vertices: mmap_file(&format!("{}/admin_vertices.bin", dir))?,
+            place_cells: mmap_file_optional(&format!("{}/place_cells.bin", dir)),
+            place_entries: mmap_file_optional(&format!("{}/place_entries.bin", dir)),
+            place_nodes: mmap_file_optional(&format!("{}/place_nodes.bin", dir)),
             strings: mmap_file(&format!("{}/strings.bin", dir))?,
             street_cell_level,
             admin_cell_level,
+            place_cell_level,
             max_distance_sq,
         })
     }
@@ -457,13 +480,72 @@ impl Index {
         result
     }
 
+    // --- Place node lookup (city/town/village nearest-neighbor) ---
+
+    fn find_place_city(&self, lat: f64, lng: f64) -> Option<&str> {
+        let place_cells = self.place_cells.as_ref()?;
+        let place_entries = self.place_entries.as_ref()?;
+        let place_nodes_mmap = self.place_nodes.as_ref()?;
+
+        let all_places: &[PlaceNode] = unsafe {
+            std::slice::from_raw_parts(
+                place_nodes_mmap.as_ptr() as *const PlaceNode,
+                place_nodes_mmap.len() / std::mem::size_of::<PlaceNode>(),
+            )
+        };
+
+        if all_places.is_empty() {
+            return None;
+        }
+
+        let cell = cell_id_at_level(lat, lng, self.place_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.place_cell_level);
+
+        let cos_lat = lat.to_radians().cos();
+
+        let mut best_dist = f64::MAX;
+        let mut best_name: Option<&str> = None;
+        let mut best_rank = u8::MAX;
+
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            let offset = Self::lookup_admin_cell(place_cells, c);
+            Self::for_each_entry(place_entries, offset, |id| {
+                let node = &all_places[id as usize];
+                // Only city (1), town (2), village (3)
+                if node.rank > 3 {
+                    return;
+                }
+                let dlat = (node.lat as f64 - lat).to_radians();
+                let dlng = (node.lng as f64 - lng).to_radians();
+                let dist = dist_sq(dlat, dlng, cos_lat);
+                // Prefer best rank (lower = more specific), break ties by distance.
+                // No hard radius limit: the S2 cell neighbourhood at level 13 already
+                // covers roughly 14 km × 14 km, which is a reasonable search area.
+                if node.rank < best_rank || (node.rank == best_rank && dist < best_dist) {
+                    best_dist = dist;
+                    best_name = Some(self.get_string(node.name_id));
+                    best_rank = node.rank;
+                }
+            });
+        }
+
+        best_name
+    }
+
     // --- Combined query ---
 
     fn query(&self, lat: f64, lng: f64) -> Address<'_> {
         let max_dist = self.max_distance_sq;
 
-        let admin = self.find_admin(lat, lng);
+        let mut admin = self.find_admin(lat, lng);
         let (addr, interp, street) = self.query_geo(lat, lng);
+
+        // Override city with nearest place node (city/town/village) if available.
+        // place=* nodes reflect the actual locality name (e.g. a town district inside
+        // a larger municipality), matching Nominatim's <town> behaviour.
+        if let Some(place_city) = self.find_place_city(lat, lng) {
+            admin.city = Some(place_city);
+        }
 
         // Determine house_number and road from best geo match (priority: address > interpolation > street)
         let mut house_number: Option<Cow<'_, str>> = None;
@@ -746,13 +828,14 @@ async fn main() {
     };
     let street_cell_level = arg_value("--street-level").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_STREET_CELL_LEVEL);
     let admin_cell_level = arg_value("--admin-level").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_ADMIN_CELL_LEVEL);
+    let place_cell_level = arg_value("--place-level").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_PLACE_CELL_LEVEL);
     let search_distance = arg_value("--search-distance").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SEARCH_DISTANCE);
 
     let db_path = format!("{}/geocoder.json", data_dir);
     let db = auth::Db::load(&db_path);
 
     eprintln!("Loading index from {}...", data_dir);
-    let index = match Index::load(data_dir, street_cell_level, admin_cell_level, search_distance) {
+    let index = match Index::load(data_dir, street_cell_level, admin_cell_level, place_cell_level, search_distance) {
         Ok(idx) => Arc::new(idx),
         Err(e) => {
             eprintln!("Error: {}", e);
